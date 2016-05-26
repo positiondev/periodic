@@ -18,7 +18,9 @@ data Scheduler = Scheduler Text R.Connection (MVar [(Text, Period, IO ())])
 
 newtype Time = Time DiffTime -- time from midnight UTC
 
-data Period = Daily Time
+newtype Seconds = Seconds Int
+
+data Period = Daily Time | Every Seconds
 
 create :: Text -> R.Connection -> IO Scheduler
 create name rconn = do mv <- newMVar []
@@ -29,20 +31,28 @@ schedule job when (Scheduler _ _ mv) act =
   do modifyMVar_ mv (return . (:) (job, when, act))
      return ()
 
-seconds = 1000000
-day = 86400 * seconds
-hours = 3600 * seconds
-checkPeriod = 100 * seconds
-lockTimeout = 10 * hours
+checkPeriod = 100
+lockTimeout = 10 * 3600
 
 run :: Scheduler -> IO ()
 run (Scheduler nm rconn mv) = forever $ do now <- getCurrentTime
                                            tasks <- readMVar mv
                                            mapM_ (tryRunTask nm rconn now) tasks
-                                           threadDelay checkPeriod
+                                           threadDelay (checkPeriod * 1000000)
 
-nextRunTime :: Period -> UTCTime -> UTCTime
-nextRunTime (Daily (Time t)) now = now { utctDayTime = t }
+lastRunKey pname name = T.encodeUtf8 $ pname <> "-" <> name <> "-last-run"
+lockedAtKey pname name = T.encodeUtf8 $ pname <> "-" <> name <> "-running-at"
+
+destroy :: Scheduler -> IO ()
+destroy (Scheduler nm rconn mv) = do tasks <- readMVar mv
+                                     R.runRedis rconn $ R.del (concatMap (\(tnm,_,_) -> [lastRunKey nm tnm, lockedAtKey nm tnm]) tasks)
+                                     return ()
+
+nextRunTime :: Period -> UTCTime -> Maybe UTCTime -> UTCTime
+nextRunTime (Daily (Time t)) now _ = now { utctDayTime = t }
+nextRunTime (Every (Seconds n)) now Nothing = now
+nextRunTime (Every (Seconds n)) now (Just last) =
+  now { utctDayTime = utctDayTime last + fromIntegral n}
 
 collapseError :: Either a (Maybe b) -> Maybe b
 collapseError (Left _) = Nothing
@@ -57,34 +67,50 @@ parseUnixTime = posixSecondsToUTCTime . fromIntegral . read . T.unpack . T.decod
 
 renderUnixTime = T.encodeUtf8 . T.pack . show . utcTimeToPOSIXSeconds
 
+close :: NominalDiffTime -> UTCTime -> UTCTime -> Bool
+close interval a b = abs (diffUTCTime a b) < interval
+
+further :: NominalDiffTime -> UTCTime -> UTCTime -> Bool
+further interval a b = not (close interval a b)
+
+shouldRun :: Maybe UTCTime -> UTCTime -> UTCTime -> Bool
+shouldRun Nothing now next
+  | close (fromIntegral checkPeriod * 5) now next
+  = True
+shouldRun (Just locked) now next
+  | further (fromIntegral lockTimeout) now locked &&
+    close (fromIntegral checkPeriod * 5) now next
+  = True
+shouldRun _ _ _ = False
+
 tryRunTask :: Text -> R.Connection -> UTCTime -> (Text, Period, IO ()) -> IO ()
 tryRunTask pname rconn now (name, period, task) =
-  do let key = T.encodeUtf8 $ pname <> "-" <> name <> "-last-run"
-     let locked = T.encodeUtf8 $ pname <> "-" <> name <> "-running-at"
-     let nextRun = nextRunTime period now
-     shouldRun <- collapseNumberBoolFalse <$> R.runRedis rconn
-       -- NOTE(dbp 2016-05-22): This is the heart of this whole
-       -- library. We check if should run, which involves checking the
-       -- last time that it has run (and if it is close to when the
-       -- next scheduled run is) and simultaneously if it has been
-       -- locked. Note that since we need to handle the fact that a
-       -- worker could have claimed it and then died, we have to check
-       -- even when we are not anywhere near the actual scheduled
-       -- time.
-       (R.eval "local last = redis.call('get', KEYS[1])\n\
-               \local lock = redis.call('get', KEYS[2])\n\
-               \if lock ~= nil and math.abs(ARGV[1] - lock) > ARGV[4] then\n\
-               \  redis.call('set', KEYS[1], ARGV[1])\n\
-               \  redis.call('set', KEYS[2], ARGV[1])\n\
-               \  return 1\n\
-               \elseif math.abs(ARGV[1] - ARGV[2]) < ARGV[3] and (last == nil or math.abs(last - ARGV[1]) > ARGV[4]) and lock == nil then\n\
-               \  redis.call('set', KEYS[1], ARGV[1])\n\
-               \  redis.call('set', KEYS[2], ARGV[1])\n\
-               \  redis.call(''\n\
-               \  return 1\n\
-               \else\n\
-               \  return 0\
-               \end" [key, locked] [renderUnixTime now, renderUnixTime nextRun, T.encodeUtf8 . T.pack . show $ 10 * checkPeriod, T.encodeUtf8 . T.pack . show $ lockTimeout])
-     when shouldRun $ do task
-                         R.runRedis rconn $ R.del [locked]
-                         return ()
+  do let lastRunKey = T.encodeUtf8 $ pname <> "-" <> name <> "-last-run"
+     let lockedAtKey = T.encodeUtf8 $ pname <> "-" <> name <> "-running-at"
+     lastRun <- fmap parseUnixTime . collapseError <$>
+                R.runRedis rconn (R.get lastRunKey)
+     lockedAt <- fmap parseUnixTime . collapseError <$>
+                 R.runRedis rconn (R.get lockedAtKey)
+     let nextRun = nextRunTime period now lastRun
+     when (shouldRun lockedAt now nextRun) $
+       do gotLock <-
+            collapseNumberBoolFalse <$> R.runRedis rconn
+            (R.eval "local lock = redis.call('get', KEYS[1])\n\
+                    \if (lock == nil && ARGV[1] == 0) || (lock == ARGV[1]) then\n\
+                    \  redis.call('set', KEYS[1], ARGV[2])\n\
+                    \  return 1\n\
+                    \else\n\
+                    \  return 0\n\
+                    \end" [lockedAtKey]
+                          [maybe "0" renderUnixTime lockedAt
+                          , renderUnixTime now])
+          when gotLock $ do task
+                            -- TODO(dbp 2016-05-26): Run task in
+                            -- thread to handle failure, log it
+                            -- somehow...
+                            R.runRedis rconn (R.eval "redis.call('del', KEYS[1])\n\
+                                                     \redis.call('set', KEYS[2], ARGV[1])"
+                                                     [lockedAtKey, lastRunKey]
+                                                     [renderUnixTime now])
+                              :: IO (Either R.Reply (Maybe Integer))
+                            return ()
