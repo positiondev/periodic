@@ -37,7 +37,7 @@ main = hspec $
             do mvar <- newMVar 0
                rconn <- R.connect R.defaultConnectInfo
                scheduler <- create (Name "simple-1") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
-               addTask scheduler "job-1" (Every (Seconds 100)) (modifyMVarMasked_ mvar (return . (+1)))
+               addTask scheduler "job" (Every (Seconds 100)) (modifyMVarMasked_ mvar (return . (+1)))
 
                wthread <- forkIO (run scheduler)
                threadDelay 30000
@@ -49,7 +49,7 @@ main = hspec $
              do mvar <- newMVar 0
                 rconn <- R.connect R.defaultConnectInfo
                 scheduler <- create (Name "simple-2") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
-                addTask scheduler "job-2" (Every (Seconds 100)) (modifyMVarMasked_ mvar (return . (+1)))
+                addTask scheduler "job" (Every (Seconds 100)) (modifyMVarMasked_ mvar (return . (+1)))
                 wthread1 <- forkIO (run scheduler)
                 wthread2 <- forkIO (run scheduler)
                 wthread3 <- forkIO (run scheduler)
@@ -64,14 +64,41 @@ main = hspec $
              do mvar <- newMVar 0
                 rconn <- R.connect R.defaultConnectInfo
                 scheduler <- create (Name "simple-3") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
-                addTask scheduler "job-3" (Every (Seconds 1)) (modifyMVarMasked_ mvar (return . (+1)))
+                addTask scheduler "job" (Every (Seconds 2)) (modifyMVarMasked_ mvar (return . (+1)))
                 wthread1 <- forkIO (run scheduler)
                 wthread2 <- forkIO (run scheduler)
                 wthread3 <- forkIO (run scheduler)
-                threadDelay 2900000
+                threadDelay 4000000
                 killThread wthread1
                 killThread wthread2
                 killThread wthread3
                 destroy scheduler
                 v <- takeMVar mvar
-                v `shouldBe` 3
+                -- NOTE(dbp 2016-05-26): Precise timing is hard
+                -- without making the tests super slow.
+                (v == 3 || v == 2) `shouldBe` True
+          it "should run at scheduled time" $
+             do mvar <- newMVar 0
+                rconn <- R.connect R.defaultConnectInfo
+                scheduler <- create (Name "simple-4") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
+                seconds <- utctDayTime <$> getCurrentTime
+                addTask scheduler "job" (Daily (Time seconds)) (modifyMVarMasked_ mvar (return . (+1)))
+                wthread <- forkIO (run scheduler)
+                threadDelay 4000000
+                killThread wthread
+                destroy scheduler
+                v <- takeMVar mvar
+                v `shouldBe` 1
+          it "should not run at an unscheduled time" $
+             do mvar <- newMVar 0
+                rconn <- R.connect R.defaultConnectInfo
+                scheduler <- create (Name "simple-4") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
+                now <- getCurrentTime
+                let seconds = utctDayTime $ addUTCTime 3600 now
+                addTask scheduler "job" (Daily (Time seconds)) (modifyMVarMasked_ mvar (return . (+1)))
+                wthread <- forkIO (run scheduler)
+                threadDelay 2000000
+                killThread wthread
+                destroy scheduler
+                v <- takeMVar mvar
+                v `shouldBe` 0

@@ -7,6 +7,8 @@ import           Control.Concurrent      (threadDelay)
 import           Control.Concurrent.MVar
 import           Control.Monad           (forever, join, when)
 import           Data.Monoid
+import           Data.Ratio
+import           Data.Serialize
 import           Data.Text               (Text)
 import qualified Data.Text               as T
 import qualified Data.Text.Encoding      as T
@@ -75,9 +77,11 @@ collapseNumberBoolFalse (Left e) = error (show e)
 collapseNumberBoolFalse (Right (Just 1)) = True
 collapseNumberBoolFalse (Right (Just 0)) = False
 
-parseUnixTime = posixSecondsToUTCTime . fromIntegral . read . T.unpack . T.decodeUtf8
 
-renderUnixTime = T.encodeUtf8 . T.pack . show . (round :: NominalDiffTime -> Integer) . utcTimeToPOSIXSeconds
+
+parseUnixTime s = let Right (n, d) = decode s in posixSecondsToUTCTime $ fromRational $ n % d
+
+renderUnixTime t = let r =  toRational . utcTimeToPOSIXSeconds $ t in encode (numerator r, denominator r)
 
 minutes5 = 60 * 5
 
