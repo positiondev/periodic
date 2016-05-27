@@ -23,11 +23,12 @@ main :: IO ()
 main = hspec $
   do describe "shouldRun" $
        do it "should run if it's never been run, not locked and time just passed" $
-            shouldRun (Daily (Time 5)) Nothing Nothing (time (date 2016 5 5) 0 0 6)
+            shouldRun (LockTimeout (Seconds 1000)) (Daily (Time 5)) Nothing Nothing (time (date 2016 5 5) 0 0 6)
           it "shouldn't run if it was locked recently" $
-            not $ shouldRun (Daily (Time 5)) (Just (time (date 2016 5 4) 23 45 0)) (Just (time (date 2016 5 4) 23 45 0)) (time (date 2016 5 5) 0 0 6)
+            not $ shouldRun (LockTimeout (Seconds 1000)) (Daily (Time 5)) (Just (time (date 2016 5 4) 23 45 0)) (Just (time (date 2016 5 4) 23 45 0)) (time (date 2016 5 5) 0 0 6)
           it "should run if it was locked a long time ago" $
-            shouldRun (Daily (Time 5))
+            shouldRun (LockTimeout (Seconds 1000))
+                      (Daily (Time 5))
                       (Just (date 2016 5 4))
                       (Just (date 2016 5 4))
                       (date 2016 5 5)

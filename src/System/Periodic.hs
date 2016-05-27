@@ -45,10 +45,10 @@ addTask scheduler job when act =
 lockTimeout = 10 * 3600
 
 run :: Scheduler -> IO ()
-run (Scheduler (Name nm) rconn mv (CheckInterval (Seconds check)) _) = forever $
+run (Scheduler (Name nm) rconn mv (CheckInterval (Seconds check)) lock) = forever $
     do now <- getCurrentTime
        tasks <- readMVar mv
-       mapM_ (tryRunTask check nm rconn now) tasks
+       mapM_ (tryRunTask lock nm rconn now) tasks
        threadDelay (check * 1000000)
 
 lastStartedKey pname name =
@@ -81,31 +81,31 @@ renderUnixTime = T.encodeUtf8 . T.pack . show . (round :: NominalDiffTime -> Int
 
 minutes5 = 60 * 5
 
-shouldRun :: Period -> Maybe UTCTime -> Maybe UTCTime -> UTCTime -> Bool
-shouldRun _ _ (Just locked) now
-  = diffUTCTime now locked > lockTimeout
-shouldRun (Daily (Time t)) Nothing _ now
+shouldRun :: LockTimeout -> Period -> Maybe UTCTime -> Maybe UTCTime -> UTCTime -> Bool
+shouldRun (LockTimeout (Seconds timeout)) _ _ (Just locked) now
+  = diffUTCTime now locked > fromIntegral timeout
+shouldRun _ (Daily (Time t)) Nothing _ now
   | now > (now { utctDayTime = t }) && utctDayTime now - t < minutes5
   = True
-shouldRun (Daily (Time t)) (Just last) _ now
+shouldRun _ (Daily (Time t)) (Just last) _ now
   | now > (now { utctDayTime = t }) && last < (now { utctDayTime = t })
   = True
-shouldRun (Every (Seconds n)) Nothing _ now
+shouldRun _ (Every (Seconds n)) Nothing _ now
   = True
-shouldRun (Every (Seconds n)) (Just last) locked now
+shouldRun _ (Every (Seconds n)) (Just last) locked now
   = diffUTCTime now last > fromIntegral n
-shouldRun period last locked now = False
+shouldRun lock period last locked now = False
 
 
-tryRunTask :: Int -> Text -> R.Connection -> UTCTime -> (Text, Period, IO ()) -> IO ()
-tryRunTask check pname rconn now (name, period, task) =
+tryRunTask :: LockTimeout -> Text -> R.Connection -> UTCTime -> (Text, Period, IO ()) -> IO ()
+tryRunTask timeout pname rconn now (name, period, task) =
   do lastStarted <- fmap parseUnixTime . collapseError <$>
                     R.runRedis rconn
                                (R.get (lastStartedKey pname name))
      lockedAt <- fmap parseUnixTime . collapseError <$>
                  R.runRedis rconn
                             (R.get (lockedKey pname name))
-     when (shouldRun period lastStarted lockedAt now) $
+     when (shouldRun timeout period lastStarted lockedAt now) $
        do gotLock <-
             collapseNumberBoolFalse <$> R.runRedis rconn
             (R.eval "local lock = redis.call('get', KEYS[1])\n\
