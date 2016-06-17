@@ -1,10 +1,12 @@
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE PartialTypeSignatures #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
 
 module System.Periodic where
 
-import           Control.Concurrent      (threadDelay)
+import           Control.Concurrent      (forkIO, threadDelay)
 import           Control.Concurrent.MVar
+import           Control.Exception       (SomeException, catch)
 import           Control.Monad           (forever, join, when)
 import           Data.Monoid
 import           Data.Ratio
@@ -126,9 +128,13 @@ tryRunTask timeout pname rconn now (name, period, task) =
                           ,maybe "0" renderUnixTime lastStarted
                           ,renderUnixTime now])
           when gotLock $
-            do task
-               -- TODO(dbp 2016-05-26): Run task in
-               -- thread to handle failure, log it
-               -- somehow...
+            do x <- newEmptyMVar
+               jt <- forkIO (catch (task >> putMVar x Nothing)
+                                   (\(e::SomeException) ->
+                                      putMVar x (Just e)))
+               res <- takeMVar x
+               case res of
+                 Just e -> print $ "Exception raised: " <> show e
+                 Nothing -> return ()
                R.runRedis rconn $ R.del [lockedKey pname name]
                return ()

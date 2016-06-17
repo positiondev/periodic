@@ -1,9 +1,9 @@
-{-# LANGUAGE DeriveGeneric         #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
 import           Control.Concurrent      (forkIO, killThread, threadDelay)
 import           Control.Concurrent.MVar (MVar, modifyMVarMasked_, newMVar,
                                           readMVar, takeMVar)
+import           Control.Monad           (replicateM)
 import qualified Data.Text               as T
 import           Data.Time.Calendar
 import           Data.Time.Clock
@@ -19,6 +19,10 @@ date y m d = UTCTime (fromGregorian y m d) 0
 time :: UTCTime -> Int -> Int -> Int -> UTCTime
 time t h m s = t { utctDayTime = fromIntegral $ h * 60 * 60 + m * 60 + s }
 
+runNThreads :: Int -> Int -> Scheduler -> IO ()
+runNThreads n delay sched = do threads <- replicateM n (forkIO $ run sched)
+                               threadDelay delay
+                               mapM_ killThread threads
 main :: IO ()
 main = hspec $
   do describe "shouldRun" $
@@ -39,9 +43,8 @@ main = hspec $
                scheduler <- create (Name "simple-1") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
                addTask scheduler "job" (Every (Seconds 100)) (modifyMVarMasked_ mvar (return . (+1)))
 
-               wthread <- forkIO (run scheduler)
-               threadDelay 30000
-               killThread wthread
+               runNThreads 1 30000 scheduler
+
                destroy scheduler
                v <- takeMVar mvar
                1 `shouldBe` v
@@ -50,13 +53,7 @@ main = hspec $
                 rconn <- R.connect R.defaultConnectInfo
                 scheduler <- create (Name "simple-2") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
                 addTask scheduler "job" (Every (Seconds 100)) (modifyMVarMasked_ mvar (return . (+1)))
-                wthread1 <- forkIO (run scheduler)
-                wthread2 <- forkIO (run scheduler)
-                wthread3 <- forkIO (run scheduler)
-                threadDelay 100000
-                killThread wthread1
-                killThread wthread2
-                killThread wthread3
+                runNThreads 3 100000 scheduler
                 destroy scheduler
                 v <- takeMVar mvar
                 v `shouldBe` 1
@@ -65,13 +62,7 @@ main = hspec $
                 rconn <- R.connect R.defaultConnectInfo
                 scheduler <- create (Name "simple-3") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
                 addTask scheduler "job" (Every (Seconds 2)) (modifyMVarMasked_ mvar (return . (+1)))
-                wthread1 <- forkIO (run scheduler)
-                wthread2 <- forkIO (run scheduler)
-                wthread3 <- forkIO (run scheduler)
-                threadDelay 4000000
-                killThread wthread1
-                killThread wthread2
-                killThread wthread3
+                runNThreads 3 4000000 scheduler
                 destroy scheduler
                 v <- takeMVar mvar
                 -- NOTE(dbp 2016-05-26): Precise timing is hard
@@ -83,9 +74,7 @@ main = hspec $
                 scheduler <- create (Name "simple-4") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
                 seconds <- utctDayTime <$> getCurrentTime
                 addTask scheduler "job" (Daily (Time seconds)) (modifyMVarMasked_ mvar (return . (+1)))
-                wthread <- forkIO (run scheduler)
-                threadDelay 4000000
-                killThread wthread
+                runNThreads 1 4000000 scheduler
                 destroy scheduler
                 v <- takeMVar mvar
                 v `shouldBe` 1
@@ -96,9 +85,21 @@ main = hspec $
                 now <- getCurrentTime
                 let seconds = utctDayTime $ addUTCTime 3600 now
                 addTask scheduler "job" (Daily (Time seconds)) (modifyMVarMasked_ mvar (return . (+1)))
-                wthread <- forkIO (run scheduler)
-                threadDelay 2000000
-                killThread wthread
+                runNThreads 1 2000000 scheduler
                 destroy scheduler
                 v <- takeMVar mvar
                 v `shouldBe` 0
+     describe "error handling" $
+       do it "should keep running jobs if one throws an exception" $
+            do mvar <- newMVar 0
+               rconn <- R.connect R.defaultConnectInfo
+               scheduler <- create (Name "error-1") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
+               addTask scheduler "job-error" (Every (Seconds 100)) (error "blowing up")
+               thread <- forkIO $ run scheduler
+               threadDelay 300000
+               addTask scheduler "job-success" (Every (Seconds 100)) (modifyMVarMasked_ mvar (return . (+1)))
+               threadDelay 2000000
+               killThread thread
+               destroy scheduler
+               v <- takeMVar mvar
+               1 `shouldBe` v
