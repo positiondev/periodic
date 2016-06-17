@@ -30,16 +30,24 @@ newtype Name = Name Text
 newtype CheckInterval = CheckInterval Seconds
 newtype LockTimeout = LockTimeout Seconds
 
+type Logger = Text -> IO ()
 data Scheduler = Scheduler { schedulerName          :: Name
                            , schedulerRedisConn     :: R.Connection
                            , schedulerTasks         :: MVar [(Text, Period, IO ())]
                            , schedulerCheckInterval :: CheckInterval
                            , schedulerLockTimout    :: LockTimeout
+                           , schedulerLogger        :: Logger
                            }
 
-create :: Name -> R.Connection -> CheckInterval -> LockTimeout -> IO Scheduler
-create name rconn check lock = do mv <- newMVar []
-                                  return $ Scheduler name rconn mv check lock
+create :: Name
+       -> R.Connection
+       -> CheckInterval
+       -> LockTimeout
+       -> (Text -> IO ())
+       -> IO Scheduler
+create name rconn check lock logger =
+  do mv <- newMVar []
+     return $ Scheduler name rconn mv check lock logger
 
 addTask :: Scheduler -> Text -> Period -> IO () -> IO ()
 addTask scheduler job when act =
@@ -49,10 +57,10 @@ addTask scheduler job when act =
 lockTimeout = 10 * 3600
 
 run :: Scheduler -> IO ()
-run (Scheduler (Name nm) rconn mv (CheckInterval (Seconds check)) lock) = forever $
+run (Scheduler (Name nm) rconn mv (CheckInterval (Seconds check)) lock logger) = forever $
     do now <- getCurrentTime
        tasks <- readMVar mv
-       mapM_ (tryRunTask lock nm rconn now) tasks
+       mapM_ (tryRunTask logger lock nm rconn now) tasks
        threadDelay (check * 1000000)
 
 lastStartedKey pname name =
@@ -61,7 +69,7 @@ lockedKey pname name =
   T.encodeUtf8 $ pname <> "-" <> name <> "-running-at"
 
 destroy :: Scheduler -> IO ()
-destroy (Scheduler (Name nm) rconn mv _ _) =
+destroy (Scheduler (Name nm) rconn mv _ _ _) =
   do tasks <- readMVar mv
      R.runRedis rconn $
        R.del (concatMap (\(tnm,_,_) ->
@@ -78,7 +86,6 @@ collapseNumberBoolFalse :: Either R.Reply (Maybe Integer) -> Bool
 collapseNumberBoolFalse (Left e) = error (show e)
 collapseNumberBoolFalse (Right (Just 1)) = True
 collapseNumberBoolFalse (Right (Just 0)) = False
-
 
 
 parseUnixTime s = let Right (n, d) = decode s in posixSecondsToUTCTime $ fromRational $ n % d
@@ -103,8 +110,8 @@ shouldRun _ (Every (Seconds n)) (Just last) locked now
 shouldRun lock period last locked now = False
 
 
-tryRunTask :: LockTimeout -> Text -> R.Connection -> UTCTime -> (Text, Period, IO ()) -> IO ()
-tryRunTask timeout pname rconn now (name, period, task) =
+tryRunTask :: Logger -> LockTimeout -> Text -> R.Connection -> UTCTime -> (Text, Period, IO ()) -> IO ()
+tryRunTask logger timeout pname rconn now (name, period, task) =
   do lastStarted <- fmap parseUnixTime . collapseError <$>
                     R.runRedis rconn
                                (R.get (lastStartedKey pname name))
@@ -134,7 +141,12 @@ tryRunTask timeout pname rconn now (name, period, task) =
                                       putMVar x (Just e)))
                res <- takeMVar x
                case res of
-                 Just e -> print $ "Exception raised: " <> show e
+                 Just e -> logger $ T.concat ["periodic["
+                                             ,pname
+                                             ,"::"
+                                             ,name
+                                             ,"] error: "
+                                             ,T.pack (show e)]
                  Nothing -> return ()
                R.runRedis rconn $ R.del [lockedKey pname name]
                return ()

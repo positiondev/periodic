@@ -23,6 +23,14 @@ runNThreads :: Int -> Int -> Scheduler -> IO ()
 runNThreads n delay sched = do threads <- replicateM n (forkIO $ run sched)
                                threadDelay delay
                                mapM_ killThread threads
+
+createSch :: T.Text -> IO Scheduler
+createSch n = createSch' n print
+
+createSch' :: T.Text -> Logger -> IO Scheduler
+createSch' n l = do rconn <- R.connect R.defaultConnectInfo
+                    create (Name n) rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000)) l
+
 main :: IO ()
 main = hspec $
   do describe "shouldRun" $
@@ -39,8 +47,7 @@ main = hspec $
      describe "simple job" $
        do it "should run " $
             do mvar <- newMVar 0
-               rconn <- R.connect R.defaultConnectInfo
-               scheduler <- create (Name "simple-1") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
+               scheduler <- createSch "simple-1"
                addTask scheduler "job" (Every (Seconds 100)) (modifyMVarMasked_ mvar (return . (+1)))
 
                runNThreads 1 30000 scheduler
@@ -50,8 +57,7 @@ main = hspec $
                1 `shouldBe` v
           it "should only run once per scheduled time" $
              do mvar <- newMVar 0
-                rconn <- R.connect R.defaultConnectInfo
-                scheduler <- create (Name "simple-2") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
+                scheduler <- createSch "simple-2"
                 addTask scheduler "job" (Every (Seconds 100)) (modifyMVarMasked_ mvar (return . (+1)))
                 runNThreads 3 100000 scheduler
                 destroy scheduler
@@ -59,8 +65,7 @@ main = hspec $
                 v `shouldBe` 1
           it "should run at each time point" $
              do mvar <- newMVar 0
-                rconn <- R.connect R.defaultConnectInfo
-                scheduler <- create (Name "simple-3") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
+                scheduler <- createSch "simple-3"
                 addTask scheduler "job" (Every (Seconds 2)) (modifyMVarMasked_ mvar (return . (+1)))
                 runNThreads 3 4000000 scheduler
                 destroy scheduler
@@ -70,8 +75,7 @@ main = hspec $
                 (v == 3 || v == 2) `shouldBe` True
           it "should run at scheduled time" $
              do mvar <- newMVar 0
-                rconn <- R.connect R.defaultConnectInfo
-                scheduler <- create (Name "simple-4") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
+                scheduler <- createSch "simple-4"
                 seconds <- utctDayTime <$> getCurrentTime
                 addTask scheduler "job" (Daily (Time seconds)) (modifyMVarMasked_ mvar (return . (+1)))
                 runNThreads 1 4000000 scheduler
@@ -80,8 +84,7 @@ main = hspec $
                 v `shouldBe` 1
           it "should not run at an unscheduled time" $
              do mvar <- newMVar 0
-                rconn <- R.connect R.defaultConnectInfo
-                scheduler <- create (Name "simple-4") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
+                scheduler <- createSch "simple-4"
                 now <- getCurrentTime
                 let seconds = utctDayTime $ addUTCTime 3600 now
                 addTask scheduler "job" (Daily (Time seconds)) (modifyMVarMasked_ mvar (return . (+1)))
@@ -92,8 +95,7 @@ main = hspec $
      describe "error handling" $
        do it "should keep running jobs if one throws an exception" $
             do mvar <- newMVar 0
-               rconn <- R.connect R.defaultConnectInfo
-               scheduler <- create (Name "error-1") rconn (CheckInterval (Seconds 1)) (LockTimeout (Seconds 1000))
+               scheduler <- createSch' "error-1" (const $ return ())
                addTask scheduler "job-error" (Every (Seconds 100)) (error "blowing up")
                thread <- forkIO $ run scheduler
                threadDelay 300000
@@ -103,3 +105,13 @@ main = hspec $
                destroy scheduler
                v <- takeMVar mvar
                1 `shouldBe` v
+          it "should send exception to logger" $
+            do mvar <- newMVar []
+               scheduler <- createSch' "error-1" (\t -> modifyMVarMasked_ mvar (return . (t:)))
+               addTask scheduler "job-error" (Every (Seconds 100)) (error "blowing up")
+               thread <- forkIO $ run scheduler
+               threadDelay 500000
+               killThread thread
+               destroy scheduler
+               v <- takeMVar mvar
+               length v `shouldBe` 1
