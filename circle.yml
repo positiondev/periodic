@@ -1,0 +1,15 @@
+dependencies:
+  cache_directories:
+    - "~/.stack"
+  pre:
+    - wget https://github.com/commercialhaskell/stack/releases/download/v1.1.2/stack-1.1.2-linux-x86_64.tar.gz -O /tmp/stack.tar.gz
+    - tar xvzf /tmp/stack.tar.gz -C /tmp
+    - sudo mv /tmp/stack-1.1.2-linux-x86_64/stack /usr/bin/stack
+  override:
+    - stack setup
+    - stack build
+    - stack test ; echo 0 # We want the test deps cached... :(
+
+test:
+  override:
+    - stack test
